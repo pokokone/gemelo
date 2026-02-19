@@ -1,0 +1,112 @@
+name: Build and Release macOS App
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      DERIVED_DATA_PATH: ${{ github.workspace }}/build
+      SPM_CACHE_PATH: ${{ github.workspace }}/build/SourcePackages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Resolve Swift Packages
+        run: |
+          xcodebuild \
+            -project Gemelo.xcodeproj \
+            -scheme Gemelo \
+            -derivedDataPath "${DERIVED_DATA_PATH}" \
+            -clonedSourcePackagesDirPath "${SPM_CACHE_PATH}" \
+            -resolvePackageDependencies
+
+      - name: Build (Release, unsigned)
+        run: |
+          xcodebuild \
+            -project Gemelo.xcodeproj \
+            -scheme Gemelo \
+            -configuration Release \
+            -derivedDataPath "${DERIVED_DATA_PATH}" \
+            -clonedSourcePackagesDirPath "${SPM_CACHE_PATH}" \
+            -destination "generic/platform=macOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+      - name: Package app (.zip + .dmg)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH=$(find "${DERIVED_DATA_PATH}/Build/Products/Release" -maxdepth 1 -type d -name "*.app" | head -n 1)
+          if [[ -z "${APP_PATH}" ]]; then
+            echo "Release app not found"
+            exit 1
+          fi
+
+          APP_NAME=$(basename "${APP_PATH}" .app)
+          RAW_VERSION="${GITHUB_REF_NAME:-dev-${GITHUB_SHA::7}}"
+          VERSION=$(echo "${RAW_VERSION}" | sed -E 's/[^A-Za-z0-9._-]+/-/g')
+
+          mkdir -p dist
+
+          # ZIP
+          ZIP_PATH="dist/${APP_NAME}-${VERSION}.zip"
+          ditto -c -k --keepParent "${APP_PATH}" "${ZIP_PATH}"
+
+          # DMG
+          STAGING_DIR="dist/dmg-staging"
+          rm -rf "${STAGING_DIR}"
+          mkdir -p "${STAGING_DIR}"
+          cp -R "${APP_PATH}" "${STAGING_DIR}/"
+          ln -s /Applications "${STAGING_DIR}/Applications"
+
+          DMG_PATH="dist/${APP_NAME}-${VERSION}.dmg"
+          hdiutil create \
+            -volname "${APP_NAME}" \
+            -srcfolder "${STAGING_DIR}" \
+            -ov \
+            -fs HFS+ \
+            -format UDZO \
+            "${DMG_PATH}"
+
+          rm -rf "${STAGING_DIR}"
+
+          [[ -f "${ZIP_PATH}" ]]
+          [[ -f "${DMG_PATH}" ]]
+
+          echo "ZIP_PATH=${ZIP_PATH}" >> "$GITHUB_ENV"
+          echo "DMG_PATH=${DMG_PATH}" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.DMG_PATH }}
+
+      - name: Publish GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.DMG_PATH }}
+          generate_release_notes: true
